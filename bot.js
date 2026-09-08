@@ -1,13 +1,8 @@
 /**
- * @file Main File of the bot, responsible for registering events,
- * commands, interactions etc.
- *
- * @author Naman Vrati
- * @since 1.0.0
- * @version 3.3.0
+ * @file Main File of the bot
+ * @description Registers events, commands and Discord interactions.
  */
 
-// Declare constants which will be used throughout the bot.
 const fs = require("fs");
 
 const {
@@ -21,11 +16,35 @@ const {
 const { REST } = require("@discordjs/rest");
 const { Routes } = require("discord-api-types/v10");
 
-// Only token and client ID are required for global commands.
-const { token, client_id } = require("./config.json");
+/*
+ * ============================================================
+ * ENVIRONMENT VARIABLES
+ * ============================================================
+ *
+ * Render:
+ * DISCORD_TOKEN       = Your Discord Bot Token
+ * DISCORD_CLIENT_ID  = Your Discord Application ID
+ *
+ * Do NOT put your bot token directly in this file.
+ */
+
+const token = process.env.DISCORD_TOKEN;
+const client_id = process.env.DISCORD_CLIENT_ID;
+
+if (!token) {
+	console.error("❌ DISCORD_TOKEN environment variable is missing.");
+	process.exit(1);
+}
+
+if (!client_id) {
+	console.error(
+		"❌ DISCORD_CLIENT_ID environment variable is missing."
+	);
+	process.exit(1);
+}
 
 /**
- * Main Application Client
+ * Main Discord Client
  */
 const client = new Client({
 	intents: [
@@ -45,14 +64,12 @@ const client = new Client({
 client.version = "0.4.0";
 
 /**********************************************************************/
-/* Event Handler */
+/* EVENT HANDLER */
 
-// Load event files.
 const eventFiles = fs
 	.readdirSync("./events")
 	.filter((file) => file.endsWith(".js"));
 
-// Register events.
 for (const file of eventFiles) {
 	const event = require(`./events/${file}`);
 
@@ -63,15 +80,23 @@ for (const file of eventFiles) {
 	} else {
 		client.on(
 			event.name,
-			async (...args) => await event.execute(...args, client)
+			async (...args) => {
+				try {
+					await event.execute(...args, client);
+				} catch (error) {
+					console.error(
+						`❌ Error in event ${event.name}:`
+					);
+					console.error(error);
+				}
+			}
 		);
 	}
 }
 
 /**********************************************************************/
-/* Collections */
+/* COLLECTIONS */
 
-// Define command and interaction collections.
 client.commands = new Collection();
 client.slashCommands = new Collection();
 client.buttonCommands = new Collection();
@@ -83,9 +108,8 @@ client.autocompleteInteractions = new Collection();
 client.triggers = new Collection();
 
 /**********************************************************************/
-/* Legacy Commands */
+/* LEGACY COMMANDS */
 
-// Load legacy message commands.
 const commandFolders = fs.readdirSync("./commands");
 
 for (const folder of commandFolders) {
@@ -94,7 +118,9 @@ for (const folder of commandFolders) {
 		.filter((file) => file.endsWith(".js"));
 
 	for (const file of commandFiles) {
-		const command = require(`./commands/${folder}/${file}`);
+		const command = require(
+			`./commands/${folder}/${file}`
+		);
 
 		client.commands.set(command.name, command);
 
@@ -103,9 +129,8 @@ for (const folder of commandFolders) {
 }
 
 /**********************************************************************/
-/* Slash Commands */
+/* SLASH COMMANDS */
 
-// Load slash commands.
 const slashCommands = fs.readdirSync("./interactions/slash");
 
 for (const module of slashCommands) {
@@ -118,25 +143,36 @@ for (const module of slashCommands) {
 			`./interactions/slash/${module}/${commandFile}`
 		);
 
-		client.slashCommands.set(command.data.name, command);
+		if (!command.data || !command.data.name) {
+			console.warn(
+				`⚠️ Invalid slash command: ${module}/${commandFile}`
+			);
+			continue;
+		}
+
+		client.slashCommands.set(
+			command.data.name,
+			command
+		);
 
 		console.log(
-			`Loaded slash command: ${command.data.name}`
+			`Loaded slash command: /${command.data.name}`
 		);
 	}
 }
 
 /**********************************************************************/
-/* Autocomplete Interactions */
+/* AUTOCOMPLETE */
 
-// Load autocomplete interactions.
 const autocompleteInteractions = fs.readdirSync(
 	"./interactions/autocomplete"
 );
 
 for (const module of autocompleteInteractions) {
 	const files = fs
-		.readdirSync(`./interactions/autocomplete/${module}`)
+		.readdirSync(
+			`./interactions/autocomplete/${module}`
+		)
 		.filter((file) => file.endsWith(".js"));
 
 	for (const interactionFile of files) {
@@ -152,16 +188,17 @@ for (const module of autocompleteInteractions) {
 }
 
 /**********************************************************************/
-/* Context Menu Interactions */
+/* CONTEXT MENUS */
 
-// Load context-menu interactions.
 const contextMenus = fs.readdirSync(
 	"./interactions/context-menus"
 );
 
 for (const folder of contextMenus) {
 	const files = fs
-		.readdirSync(`./interactions/context-menus/${folder}`)
+		.readdirSync(
+			`./interactions/context-menus/${folder}`
+		)
 		.filter((file) => file.endsWith(".js"));
 
 	for (const file of files) {
@@ -169,17 +206,26 @@ for (const folder of contextMenus) {
 			`./interactions/context-menus/${folder}/${file}`
 		);
 
+		if (!menu.data || !menu.data.name) {
+			console.warn(
+				`⚠️ Invalid context menu: ${folder}/${file}`
+			);
+			continue;
+		}
+
 		const keyName =
 			`${folder.toUpperCase()} ${menu.data.name}`;
 
-		client.contextCommands.set(keyName, menu);
+		client.contextCommands.set(
+			keyName,
+			menu
+		);
 	}
 }
 
 /**********************************************************************/
-/* Button Interactions */
+/* BUTTON INTERACTIONS */
 
-// Load button interactions.
 const buttonCommands = fs.readdirSync(
 	"./interactions/buttons"
 );
@@ -194,14 +240,16 @@ for (const module of buttonCommands) {
 			`./interactions/buttons/${module}/${commandFile}`
 		);
 
-		client.buttonCommands.set(command.id, command);
+		client.buttonCommands.set(
+			command.id,
+			command
+		);
 	}
 }
 
 /**********************************************************************/
-/* Modal Interactions */
+/* MODAL INTERACTIONS */
 
-// Load modal interactions.
 const modalCommands = fs.readdirSync(
 	"./interactions/modals"
 );
@@ -216,14 +264,16 @@ for (const module of modalCommands) {
 			`./interactions/modals/${module}/${commandFile}`
 		);
 
-		client.modalCommands.set(command.id, command);
+		client.modalCommands.set(
+			command.id,
+			command
+		);
 	}
 }
 
 /**********************************************************************/
-/* Select Menu Interactions */
+/* SELECT MENUS */
 
-// Load select-menu interactions.
 const selectMenus = fs.readdirSync(
 	"./interactions/select-menus"
 );
@@ -238,17 +288,20 @@ for (const module of selectMenus) {
 			`./interactions/select-menus/${module}/${commandFile}`
 		);
 
-		client.selectCommands.set(command.id, command);
+		client.selectCommands.set(
+			command.id,
+			command
+		);
 	}
 }
 
 /**********************************************************************/
-/* Register Slash Commands with Discord */
+/* REGISTER DISCORD APPLICATION COMMANDS */
 
-// Discord REST API v10.
-const rest = new REST({ version: "10" }).setToken(token);
+const rest = new REST({
+	version: "10",
+}).setToken(token);
 
-// Convert commands into Discord API JSON.
 const commandJsonData = [
 	...Array.from(client.slashCommands.values()).map(
 		(command) => command.data.toJSON()
@@ -259,16 +312,10 @@ const commandJsonData = [
 	),
 ];
 
-/*
- * Register commands globally.
- *
- * IMPORTANT:
- * Global commands can take some time to appear/update in Discord.
- */
 (async () => {
 	try {
 		console.log(
-			"Started refreshing application (/) commands..."
+			"🔄 Registering Discord application commands..."
 		);
 
 		await rest.put(
@@ -279,24 +326,21 @@ const commandJsonData = [
 		);
 
 		console.log(
-			`Successfully registered ${commandJsonData.length} application commands globally.`
+			`✅ Successfully registered ${commandJsonData.length} application commands globally.`
 		);
 	} catch (error) {
 		console.error(
-			"Failed to register application commands:"
+			"❌ Failed to register application commands:"
 		);
-
 		console.error(error);
 	}
 })();
 
 /**********************************************************************/
-/* Message-Based Chat Triggers */
+/* MESSAGE TRIGGERS */
 
-// Load trigger folders.
 const triggerFolders = fs.readdirSync("./triggers");
 
-// Load triggers.
 for (const folder of triggerFolders) {
 	const triggerFiles = fs
 		.readdirSync(`./triggers/${folder}`)
@@ -307,12 +351,32 @@ for (const folder of triggerFolders) {
 			`./triggers/${folder}/${file}`
 		);
 
-		client.triggers.set(trigger.name, trigger);
+		client.triggers.set(
+			trigger.name,
+			trigger
+		);
 	}
 }
 
 /**********************************************************************/
-/* Login */
+/* LOGIN */
 
-// Login into your Discord application.
-client.login(token);
+client.login(token)
+	.then(() => {
+		console.log("🔐 Login request sent successfully.");
+	})
+	.catch((error) => {
+		console.error("❌ Discord login failed:");
+		console.error(error);
+		process.exit(1);
+	});
+
+process.on("unhandledRejection", (error) => {
+	console.error("❌ Unhandled Promise Rejection:");
+	console.error(error);
+});
+
+process.on("uncaughtException", (error) => {
+	console.error("❌ Uncaught Exception:");
+	console.error(error);
+});

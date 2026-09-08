@@ -1,78 +1,972 @@
-const { EmbedBuilder } = require("discord.js");
+const { EmbedBuilder, ButtonBuilder, ActionRowBuilder } = require("discord.js");
 
-// Read settings from environment variables instead of config.json
-const ERROR_LOGGING_ENABLED =
-  String(process.env.PTERODACTYL_ERROR_LOGGING_ENABLED || "false").toLowerCase() ===
-  "true";
+const {
+    formatBytes,
+    formatMegabytes,
+    uptimeToString,
+    serverPowerEmoji,
+    embedColorFromStatus,
+    embedColorFromWingsStatus,
+    stripAnsi,
+    isApplicationKeyValid,
+    serverPowerEmojiOnly
+} = require("./serverUtils");
 
-function logError(...args) {
-  if (ERROR_LOGGING_ENABLED) {
-    console.error(...args);
-  }
-}
+const { getServerExtras } = require("./getServerExtras");
+const { PteroWings } = require("../requests/wingsApiReq");
+const { PteroClient } = require("../requests/clientApiReq");
+const { PteroApp } = require("../requests/appApiReq");
+const fs = require("fs");
 
-function createServerStatusEmbed(server, status) {
-  try {
-    const embed = new EmbedBuilder()
-      .setTitle(server.name || "Server Status")
-      .setTimestamp();
+// ============================================================
+// PTERODACTYL CONFIG
+// Loaded from Render environment variables instead of config.json
+// ============================================================
 
-    const normalizedStatus = String(status || "unknown").toLowerCase();
+const pterodactyl = {
+    domain: process.env.PTERODACTYL_DOMAIN || "",
+    apiKey: process.env.PTERODACTYL_API_KEY || "",
 
-    if (
-      normalizedStatus === "running" ||
-      normalizedStatus === "online"
-    ) {
-      embed
-        .setDescription("🟢 **Server is Online**")
-        .addFields({
-          name: "Status",
-          value: "Online",
-          inline: true,
-        });
-    } else if (
-      normalizedStatus === "offline" ||
-      normalizedStatus === "stopped"
-    ) {
-      embed
-        .setDescription("🔴 **Server is Offline**")
-        .addFields({
-          name: "Status",
-          value: "Offline",
-          inline: true,
-        });
-    } else if (
-      normalizedStatus === "starting" ||
-      normalizedStatus === "stopping"
-    ) {
-      embed
-        .setDescription("🟡 **Server is " + normalizedStatus + "**")
-        .addFields({
-          name: "Status",
-          value: normalizedStatus,
-          inline: true,
-        });
-    } else {
-      embed
-        .setDescription("⚪ **Server status: " + normalizedStatus + "**")
-        .addFields({
-          name: "Status",
-          value: normalizedStatus,
-          inline: true,
-        });
-    }
+    NODE_STATUS_UPDATE_INTERVAL:
+        Number(process.env.NODE_STATUS_UPDATE_INTERVAL) || 60,
 
-    return embed;
-  } catch (error) {
-    logError("Error creating server status embed:", error);
+    ERROR_LOGGING_ENABLED:
+        String(process.env.PTERODACTYL_ERROR_LOGGING_ENABLED || "false")
+            .toLowerCase() === "true",
 
-    return new EmbedBuilder()
-      .setTitle("Server Status")
-      .setDescription("⚪ Unable to determine server status.")
-      .setTimestamp();
-  }
-}
+    ENABLE_SERVER_STATUS_CONSOLE_LOGS:
+        String(process.env.ENABLE_SERVER_STATUS_CONSOLE_LOGS || "false")
+            .toLowerCase() === "true",
+
+    EMBED_FOOTER_TEXT:
+        process.env.EMBED_FOOTER_TEXT || "Pterodactyl",
+
+    EMBED_FOOTER_ICON_URL:
+        process.env.EMBED_FOOTER_ICON_URL || ""
+};
+
+
+// ============================================================
+// NODE STATUS EMBED
+// ============================================================
 
 module.exports = {
-  createServerStatusEmbed,
+
+    async createNodeStatusEmbed(nodeId, enableServerList) {
+
+        const [nodeDetailsResponse, nodeConfigResponse] = await Promise.all([
+            PteroApp.request(
+                `nodes/${nodeId}`,
+                "get",
+                { include: "location,allocations,servers" }
+            ),
+            PteroApp.request(`nodes/${nodeId}/configuration`)
+        ]);
+
+        if (!nodeDetailsResponse || !nodeConfigResponse) {
+            // Could not fetch node details/configuration.
+        }
+
+        if (
+            nodeDetailsResponse.status === 404 ||
+            nodeDetailsResponse.status === 403
+        ) {
+            console.warn(
+                `Could not fetch node details for node with ID ${nodeId}. Status code: ${nodeDetailsResponse.status}`
+            );
+
+            return null;
+        }
+
+        const nodeDetails = nodeDetailsResponse.attributes;
+        const nodeConfig = nodeConfigResponse;
+
+        const allocationCount =
+            nodeDetails.relationships.allocations.data.length || 0;
+
+        const locationDetails =
+            nodeDetails.relationships.location.attributes;
+
+
+        // Get server details from Wings
+        let servers = [];
+        let wingsInfo = null;
+
+        try {
+
+            const wingsData = await Promise.all([
+                PteroWings.request(
+                    "servers",
+                    nodeDetails,
+                    nodeConfig.token
+                ),
+
+                PteroWings.request(
+                    "system",
+                    nodeDetails,
+                    nodeConfig.token
+                )
+            ]);
+
+            servers = wingsData[0];
+            wingsInfo = wingsData[1];
+
+        } catch (error) {
+
+            console.warn(
+                `Could not fetch data from Wings for node with ID ${nodeId} : ${PteroWings.getErrorMessage(error)} You can delete the status embed if you wish to stop seeing this message.`
+            );
+
+            servers = [];
+            wingsInfo = null;
+        }
+
+
+        const nodeUsages = {
+            cpu: 0,
+            memory: 0,
+            disk: 0,
+            network_tx: 0,
+            network_rx: 0,
+            allocations: 0,
+            onlineServers: 0
+        };
+
+        let err = false;
+
+
+        for (const server of servers) {
+
+            const usage = server.utilization;
+
+            if (usage) {
+
+                nodeUsages.cpu += usage.cpu_absolute || 0;
+                nodeUsages.memory += usage.memory_bytes || 0;
+                nodeUsages.disk += usage.disk_bytes || 0;
+                nodeUsages.network_tx += usage.network.tx_bytes || 0;
+                nodeUsages.network_rx += usage.network.rx_bytes || 0;
+
+            } else {
+
+                err = true;
+            }
+
+
+            const mappings =
+                server.configuration?.allocations?.mappings;
+
+            if (mappings) {
+
+                nodeUsages.allocations +=
+                    Object.values(mappings).reduce(
+                        (sum, arr) => sum + arr.length,
+                        0
+                    ) || 0;
+            }
+
+
+            if (server.state === "running") {
+                nodeUsages.onlineServers += 1;
+            }
+        }
+
+
+        if (err) {
+
+            console.warn(
+                `Warning: One or more server usages could not be fetched for node ${nodeId}. The node usages may be incomplete or inaccurate.`
+            );
+        }
+
+
+        const nodeStatus = wingsInfo ? "online" : "offline";
+
+        const statusIcon =
+            nodeStatus === "online"
+                ? "🟢 Online"
+                : "🔴 Offline";
+
+
+        // CPU usage is 100% for each core
+        if (
+            wingsInfo &&
+            wingsInfo.cpu_count &&
+            wingsInfo.cpu_count > 0
+        ) {
+
+            nodeUsages.cpu =
+                nodeUsages.cpu / wingsInfo.cpu_count || 0;
+        }
+
+
+        const cpuCount =
+            wingsInfo?.cpu_count || "N/A";
+
+        const cpuLabel =
+            cpuCount !== "N/A"
+                ? `CPU Usage (${cpuCount}c)`
+                : "CPU Usage";
+
+
+        const now = Math.floor(Date.now() / 1000);
+
+        const embed = new EmbedBuilder()
+
+            .setAuthor({
+                name:
+                    `Node ID: ${nodeDetails.id} - Status: ${statusIcon}`
+            })
+
+            .setTitle(`${nodeDetails.name}`)
+
+            .setColor(
+                embedColorFromWingsStatus(nodeStatus)
+            )
+
+            .addFields(
+
+                {
+                    name: "FQDN",
+                    value:
+                        `\`\`\`${nodeDetails.fqdn}\`\`\``,
+                    inline: false
+                },
+
+                {
+                    name: cpuLabel,
+                    value:
+                        `\`\`\`${nodeUsages.cpu.toFixed(2)}%\`\`\``,
+                    inline: true
+                },
+
+                {
+                    name: "Memory Usage",
+                    value:
+                        `\`\`\`${formatBytes(nodeUsages.memory)} / ${formatMegabytes(nodeDetails.memory)}\`\`\``,
+                    inline: true
+                },
+
+                {
+                    name: "Disk Usage",
+                    value:
+                        `\`\`\`${formatBytes(nodeUsages.disk)} / ${formatMegabytes(nodeDetails.disk)}\`\`\``,
+                    inline: true
+                },
+
+                {
+                    name: "Network ↑",
+                    value:
+                        `\`\`\`${formatBytes(nodeUsages.network_tx)}\`\`\``,
+                    inline: true
+                },
+
+                {
+                    name: "Network ↓",
+                    value:
+                        `\`\`\`${formatBytes(nodeUsages.network_rx)}\`\`\``,
+                    inline: true
+                },
+
+                {
+                    name: "Location",
+                    value:
+                        `\`\`\`${locationDetails.short}\`\`\``,
+                    inline: true
+                },
+
+                {
+                    name: "Allocations",
+                    value:
+                        `\`\`\`${nodeUsages.allocations} / ${allocationCount}\`\`\``,
+                    inline: true
+                },
+
+                {
+                    name: "Servers Running",
+                    value:
+                        `\`\`\`${nodeUsages.onlineServers} / ${servers.length}\`\`\``,
+                    inline: true
+                },
+
+                {
+                    name: "Wings Version",
+                    value:
+                        `\`\`\`${wingsInfo ? wingsInfo.version : "N/A"}\`\`\``,
+                    inline: true
+                }
+            )
+
+            .setDescription(
+                `Last updated: <t:${now}:R>\nNext update in <t:${now + pterodactyl.NODE_STATUS_UPDATE_INTERVAL}:R>`
+            )
+
+            .setTimestamp()
+
+            .setFooter({
+                text: `${pterodactyl.EMBED_FOOTER_TEXT}`,
+                ...(pterodactyl.EMBED_FOOTER_ICON_URL
+                    ? { iconURL: pterodactyl.EMBED_FOOTER_ICON_URL }
+                    : {})
+            });
+
+
+        if (enableServerList && servers.length > 0) {
+
+            servers.sort((a, b) =>
+                a.configuration.meta.name.localeCompare(
+                    b.configuration.meta.name
+                )
+            );
+
+
+            let serverListText = servers
+                .map(server => {
+
+                    const emoji =
+                        serverPowerEmojiOnly(server.state);
+
+                    let name =
+                        server.configuration.meta.name;
+
+                    if (name.length > 32) {
+                        name =
+                            name.slice(0, 29) + "...";
+                    }
+
+                    return `${emoji} - ${name}`;
+                })
+                .join("\n");
+
+
+            serverListText =
+                `\`\`\`${serverListText}\`\`\`` ||
+                "No servers found for this node.";
+
+
+            if (serverListText.length > 1024) {
+
+                serverListText =
+                    serverListText.slice(0, 1021) + "...";
+            }
+
+
+            embed.addFields({
+                name: "Servers",
+                value: serverListText,
+                inline: false
+            });
+        }
+
+
+        return embed;
+    },
+
+
+    // ============================================================
+    // SERVER STATUS EMBED
+    // ============================================================
+
+    async createServerStatusEmbed(
+        serverId,
+        clientApiKey,
+        iconUrl,
+        enableLogs,
+        gameType = null
+    ) {
+
+        const serverInfoResponse =
+            await PteroClient.request(
+                `servers/${serverId}`,
+                clientApiKey
+            );
+
+        const serverDetails =
+            serverInfoResponse.attributes;
+
+
+        let serverResourceUsage = null;
+
+
+        try {
+
+            const resourceResponse =
+                await PteroClient.request(
+                    `servers/${serverDetails.uuid}/resources`,
+                    clientApiKey
+                );
+
+            serverResourceUsage =
+                resourceResponse.attributes;
+
+        } catch (error) {
+
+            if (pterodactyl.ERROR_LOGGING_ENABLED) {
+
+                console.warn(
+                    `Could not fetch server usage for ${serverId} : ${PteroClient.getErrorMessage(error)} The node may be offline or unreachable.`
+                );
+            }
+
+
+            serverResourceUsage = {
+
+                current_state: "unknown",
+
+                resources: {
+                    cpu_absolute: 0,
+                    memory_bytes: 0,
+                    disk_bytes: 0,
+                    uptime: 0
+                }
+            };
+        }
+
+
+        const serverPowerState =
+            serverResourceUsage.current_state ||
+            "unknown";
+
+
+        const defaultAllocation =
+            serverDetails.relationships.allocations.data.find(
+                alloc => alloc.attributes.is_default
+            );
+
+
+        if (!defaultAllocation) {
+
+            throw new Error(
+                `No default allocation found for server ${serverId}`
+            );
+        }
+
+
+        const ip =
+            defaultAllocation.attributes.ip_alias ||
+            defaultAllocation.attributes.ip;
+
+        const port =
+            defaultAllocation.attributes.port;
+
+
+        const extras =
+            await getServerExtras(
+                ip,
+                port,
+                gameType
+            );
+
+
+        let latestLogs = null;
+
+
+        if (
+            pterodactyl.ENABLE_SERVER_STATUS_CONSOLE_LOGS &&
+            enableLogs
+        ) {
+
+            const isAppKeyValid =
+                await isApplicationKeyValid();
+
+
+            if (!isAppKeyValid) {
+
+                console.warn(
+                    "The Pterodactyl application API key is invalid. Cannot fetch server logs for status embed for server ID:",
+                    serverId
+                );
+
+                return;
+            }
+
+
+            const nodes =
+                await PteroApp.request("nodes")
+                    .catch(error => {
+
+                        console.warn(
+                            `Error fetching nodes to get logs for server status embed (ID): ${serverId}:`,
+                            PteroApp.getErrorMessage(error)
+                        );
+                    });
+
+
+            if (
+                nodes !== undefined &&
+                nodes.data !== undefined
+            ) {
+
+                const node =
+                    nodes.data.find(
+                        n =>
+                            n.attributes.fqdn === ip
+                    );
+
+
+                if (node) {
+
+                    const nodeConfig =
+                        await PteroApp.request(
+                            `nodes/${node.attributes.id}/configuration`
+                        ).catch(error => {
+
+                            console.warn(
+                                `Error fetching node config to get logs for server status embed (ID): ${serverId}:`,
+                                PteroApp.getErrorMessage(error)
+                            );
+                        });
+
+
+                    if (nodeConfig) {
+
+                        const wingsLogs =
+                            await PteroWings.request(
+                                `servers/${serverDetails.uuid}/logs?size=3`,
+                                node.attributes,
+                                nodeConfig.token
+                            ).catch(error => {
+
+                                console.warn(
+                                    `Error fetching logs for server ID ${serverId} from wings:`,
+                                    PteroApp.getErrorMessage(error)
+                                );
+                            });
+
+
+                        if (wingsLogs?.data) {
+
+                            latestLogs =
+                                wingsLogs.data
+
+                                    .map(line =>
+                                        line.replace(
+                                            /.*?\[[^\]]*]\s*/,
+                                            ""
+                                        )
+                                    )
+
+                                    .join("\n");
+
+
+                            if (latestLogs.length > 512) {
+
+                                latestLogs =
+                                    latestLogs.slice(-512);
+                            }
+                        }
+                    }
+                }
+
+            } else {
+
+                console.warn(
+                    `Could not fetch nodes to get logs for server status embed (ID): ${serverId}.`
+                );
+            }
+        }
+
+
+        const embed =
+            new EmbedBuilder()
+
+                .setAuthor({
+                    name:
+                        `${serverDetails.identifier} - Status: ${serverPowerEmoji(serverPowerState)}`
+                })
+
+                .setTitle(
+                    `${serverDetails.name}`
+                )
+
+                .setColor(
+                    embedColorFromStatus(serverPowerState)
+                )
+
+                .setDescription(
+                    `Last updated: <t:${Math.floor(Date.now() / 1000)}:R>`
+                )
+
+                .addFields(
+
+                    {
+                        name: "Address",
+                        value:
+                            `\`\`\`${ip}:${port}\`\`\``,
+                        inline: false
+                    },
+
+                    {
+                        name: "CPU Usage",
+                        value:
+                            `\`\`\`${serverResourceUsage.resources.cpu_absolute.toFixed(2)}% / ${serverDetails.limits.cpu}%\`\`\``,
+                        inline: true
+                    },
+
+                    {
+                        name: "Memory Usage",
+                        value:
+                            `\`\`\`${formatBytes(serverResourceUsage.resources.memory_bytes)} / ${formatMegabytes(serverDetails.limits.memory)}\`\`\``,
+                        inline: true
+                    },
+
+                    {
+                        name: "Disk Usage",
+                        value:
+                            `\`\`\`${formatBytes(serverResourceUsage.resources.disk_bytes)} / ${formatMegabytes(serverDetails.limits.disk)}\`\`\``,
+                        inline: true
+                    },
+
+                    {
+                        name: "Uptime",
+                        value:
+                            `\`\`\`${uptimeToString(serverResourceUsage.resources.uptime)}\`\`\``,
+                        inline: true
+                    }
+                )
+
+                .setTimestamp()
+
+                .setFooter({
+                    text:
+                        `${pterodactyl.EMBED_FOOTER_TEXT}`,
+
+                    ...(pterodactyl.EMBED_FOOTER_ICON_URL
+                        ? {
+                            iconURL:
+                                pterodactyl.EMBED_FOOTER_ICON_URL
+                        }
+                        : {})
+                });
+
+
+        if (iconUrl) {
+            embed.setThumbnail(iconUrl);
+        }
+
+
+        if (
+            extras &&
+            extras.players !== undefined &&
+            extras.maxPlayers !== undefined
+        ) {
+
+            embed.addFields({
+                name: "Players",
+                value:
+                    `\`\`\`${extras.players} / ${extras.maxPlayers}\`\`\``,
+                inline: true
+            });
+        }
+
+
+        if (
+            extras &&
+            extras.version !== undefined
+        ) {
+
+            embed.addFields({
+                name: "Version",
+                value:
+                    `\`\`\`${extras.version}\`\`\``,
+                inline: true
+            });
+        }
+
+
+        if (
+            latestLogs &&
+            pterodactyl.ENABLE_SERVER_STATUS_CONSOLE_LOGS &&
+            enableLogs
+        ) {
+
+            embed.addFields({
+                name: "Latest Logs",
+                value:
+                    `\`\`\`ansi\n${latestLogs}\`\`\``,
+                inline: false
+            });
+        }
+
+
+        if (
+            extras &&
+            extras.joinLink !== undefined
+        ) {
+
+            embed.setURL(
+                extras.joinLink
+            );
+        }
+
+
+        if (
+            extras &&
+            extras.type !== undefined &&
+            gameType === null
+        ) {
+
+            if (
+                extras.type === "none" &&
+                (
+                    serverPowerState === "offline" ||
+                    serverPowerState === "stopped"
+                )
+            ) {
+
+                return embed;
+            }
+
+
+            const dataDir =
+                "./ptero/data";
+
+
+            if (!fs.existsSync(dataDir)) {
+
+                console.log(
+                    "Data directory not found, creating..."
+                );
+
+                fs.mkdirSync(
+                    dataDir,
+                    { recursive: true }
+                );
+            }
+
+
+            let statusMessages = [];
+
+
+            try {
+
+                statusMessages =
+                    JSON.parse(
+                        fs.readFileSync(
+                            "./ptero/data/statusMessages.json",
+                            "utf8"
+                        )
+                    );
+
+            } catch (error) {
+
+                console.warn(
+                    "Could not load existing status messages, creating new file."
+                );
+
+                fs.writeFileSync(
+                    "./ptero/data/statusMessages.json",
+                    JSON.stringify(
+                        statusMessages,
+                        null,
+                        4
+                    )
+                );
+            }
+
+
+            const msgInfo =
+                statusMessages.find(
+                    msg =>
+                        msg.serverId === serverId
+                );
+
+
+            if (msgInfo) {
+
+                msgInfo.serverType =
+                    extras.type;
+
+                fs.writeFileSync(
+                    "./ptero/data/statusMessages.json",
+                    JSON.stringify(
+                        statusMessages,
+                        null,
+                        4
+                    )
+                );
+            }
+        }
+
+
+        return embed;
+    },
+
+
+    // ============================================================
+    // ACCOUNT DETAILS EMBED
+    // ============================================================
+
+    async createAccountDetailsEmbed(
+        userId,
+        clientApiKey
+    ) {
+
+        try {
+
+            const userInfoResponse =
+                await PteroClient.request(
+                    "account",
+                    clientApiKey
+                );
+
+            const userInfo =
+                userInfoResponse.attributes;
+
+
+            const serversResponse =
+                await PteroClient.request(
+                    "",
+                    clientApiKey
+                );
+
+            const servers =
+                serversResponse;
+
+
+            let totalAllocatedResources = {
+                memory: 0,
+                disk: 0,
+                cpu: 0
+            };
+
+
+            for (const server of servers.data) {
+
+                totalAllocatedResources.memory +=
+                    server.attributes.limits.memory || 0;
+
+                totalAllocatedResources.disk +=
+                    server.attributes.limits.disk || 0;
+
+                totalAllocatedResources.cpu +=
+                    server.attributes.limits.cpu || 0;
+            }
+
+
+            const panelButton =
+                new ButtonBuilder()
+
+                    .setLabel("Open Panel")
+
+                    .setStyle("Link")
+
+                    .setURL(
+                        `${pterodactyl.domain}`
+                    );
+
+
+            const actionRow =
+                new ActionRowBuilder()
+                    .addComponents(
+                        panelButton
+                    );
+
+
+            const embed =
+                new EmbedBuilder()
+
+                    .setAuthor({
+                        name:
+                            `Account ID: ${userId}`
+                    })
+
+                    .setTitle(
+                        `${userInfo.username}'s Account Details`
+                    )
+
+                    .setColor(0x00AE86)
+
+                    .addFields(
+
+                        {
+                            name: "Username",
+                            value:
+                                `\`\`\`${userInfo.username}\`\`\``,
+                            inline: true
+                        },
+
+                        {
+                            name: "Name",
+                            value:
+                                `||\`\`\`${userInfo.first_name || "N/A"}\`\`\`||`,
+                            inline: true
+                        },
+
+                        {
+                            name: "Email",
+                            value:
+                                `||\`\`\`${userInfo.email}\`\`\`||`,
+                            inline: false
+                        },
+
+                        {
+                            name: "Total Allocated CPU",
+                            value:
+                                `\`\`\`${totalAllocatedResources.cpu}%\`\`\``,
+                            inline: true
+                        },
+
+                        {
+                            name: "Total Allocated Memory",
+                            value:
+                                `\`\`\`${formatMegabytes(totalAllocatedResources.memory)}\`\`\``,
+                            inline: true
+                        },
+
+                        {
+                            name: "Total Allocated Disk",
+                            value:
+                                `\`\`\`${formatMegabytes(totalAllocatedResources.disk)}\`\`\``,
+                            inline: true
+                        },
+
+                        {
+                            name: "Total Servers",
+                            value:
+                                `\`\`\`${servers.data.length}\`\`\``,
+                            inline: true
+                        },
+
+                        {
+                            name: "Admin",
+                            value:
+                                `\`\`\`${userInfo.admin ? "Yes" : "No"}\`\`\``,
+                            inline: true
+                        }
+                    )
+
+                    .setTimestamp()
+
+                    .setFooter({
+                        text:
+                            `${pterodactyl.EMBED_FOOTER_TEXT}`,
+
+                        ...(pterodactyl.EMBED_FOOTER_ICON_URL
+                            ? {
+                                iconURL:
+                                    pterodactyl.EMBED_FOOTER_ICON_URL
+                            }
+                            : {})
+                    });
+
+
+            return {
+                embed,
+                components: [actionRow]
+            };
+
+
+        } catch (error) {
+
+            console.error(
+                `Error creating account details embed for user ID ${userId}:`,
+                PteroClient.getErrorMessage(error)
+            );
+
+            throw new Error(
+                `Failed to create account details embed: ${error}`
+            );
+        }
+    }
 };
